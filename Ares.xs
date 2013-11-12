@@ -193,9 +193,13 @@ typedef struct {
 		SAVETMPS;\
 		PUSHMARK(SP);\
 		EXTEND(SP,av_len(any->res)+1);\
-		PUSHs(sv_2mortal(newRV_noinc( (SV *) any->res )));\
+		int ii;\
+		for (ii=0;ii<=av_len( any->res );ii++) {\
+			PUSHs(sv_2mortal( SvREFCNT_inc(*av_fetch(any->res,ii,1)) ));\
+		}\
 		PUTBACK;\
 		call_sv( any->cb, G_DISCARD | G_VOID );\
+		SvREFCNT_dec( any->res );\
 		SvREFCNT_dec( any->cb );\
 		SvREFCNT_dec( any->query );\
 		SvREFCNT_dec((SV *) res->any);\
@@ -229,6 +233,7 @@ static void callback_any_soa(ev_ares_result_soa * res) {
 }
 
 static void callback_any_a(ev_ares_result_a * res) {
+	//printf("Result for A '%s': %s\n",res->query, res->error);
 	struct ev_ares_a_reply* r = res->a;
 	ev_ares_any *any = (ev_ares_any *) SvPVX((SV *) res->any);
 	char ips[INET_ADDRSTRLEN];
@@ -342,7 +347,7 @@ static void callback_any_srv(ev_ares_result_srv * res) {
 			any->count++;
 			AV * one = newAV();av_extend(one, 8);
 			av_push(one, newSVsv(any->query));
-			av_push(one, newSVpvs("ns"));
+			av_push(one, newSVpvs("srv"));
 			av_push(one, newSVpvs("in"));
 			av_push(one, newSVuv(r->ttl));
 			av_push(one, newSVuv( r->priority ));
@@ -376,6 +381,28 @@ static void callback_any_ptr(ev_ares_result_ptr * res) {
 	return;
 }
 
+static void callback_any_naptr(ev_ares_result_naptr * res) {
+	struct ev_ares_naptr_reply* r = res->naptr;
+	ev_ares_any *any = (ev_ares_any *) SvPVX((SV *) res->any);
+	any->cv--;
+	/*
+	if (res->status == ARES_SUCCESS) {
+		for (; r != NULL; r = r->next) {
+			any->count++;
+			AV * one = newAV();av_extend(one, 5);
+			av_push(one, newSVsv(any->query));
+			av_push(one, newSVpvs("ptr"));
+			av_push(one, newSVpvs("in"));
+			av_push(one, newSVuv(r->ttl));
+			av_push(one, newSVpvf("%s",r->host));
+			av_push(any->res,newRV_noinc((SV*)one));
+		}
+	}
+	*/
+	check_any();
+	return;
+}
+
 static ev_ares resolver;
 
 #define RES_SOA   0b0000000000000001
@@ -388,6 +415,65 @@ static ev_ares resolver;
 #define RES_PTR   0b0000000010000000
 #define RES_NAPTR 0b0000000100000000
 #define RES_ALL   0b0000000111111111
+
+#define map_type(flags,t,l)\
+		if (l == 1) {\
+			if (*t == '*') {\
+				flags |= RES_ALL;\
+			}\
+			else\
+			if (*t == 'a' || *t == 'A') {\
+				flags |= RES_A;\
+			}\
+			else {\
+				croak("Bad type 1: %s",t);\
+			}\
+		}\
+		else\
+		if (l == 2) {\
+			if (strncasecmp( t,"ns",2 ) == 0) {\
+				flags |= RES_NS;\
+			}\
+			else\
+			if (strncasecmp( t,"mx",2 ) == 0) {\
+				flags |= RES_MX;\
+			}\
+			else {\
+				croak("Bad type: (2) %s",t);\
+			}\
+		}\
+		else\
+		if (l == 3) {\
+			if (strncasecmp( t,"soa",3 ) == 0) {\
+				flags |= RES_SOA;\
+			}\
+			else\
+			if (strncasecmp( t,"txt",3 ) == 0) {\
+				flags |= RES_TXT;\
+			}\
+			else\
+			if (strncasecmp( t,"ptr",3 ) == 0) {\
+				flags |= RES_PTR;\
+			}\
+			else\
+			if (strncasecmp( t,"srv",3 ) == 0) {\
+				flags |= RES_SRV;\
+			}\
+			else {\
+				croak("Bad type: (3) %s",t);\
+			}\
+		}\
+		else\
+		if (l == 4 && strncasecmp( t,"aaaa",4 ) == 0) {\
+			flags |= RES_AAAA;\
+		}\
+		else\
+		if (l == 5 && strncasecmp( t,"naptr",5 ) == 0) {\
+			flags |= RES_NAPTR;\
+		}\
+		else {\
+			croak("Bad type: (%d) %s",l,t);\
+		}
 
 MODULE = EV::Ares		PACKAGE = EV::Ares
 
@@ -433,77 +519,42 @@ void resolve(SV *cls, SV *host, SV * type, ...)
 	PROTOTYPE: $$@&
 	PPCODE:
 		SV * cb = ST(items-1);
+		char *t;
 		STRLEN l;
-		char * t = SvPV( type,l );
-		if (l < 1) croak("Bad type: %s",t);
+		int flags = 0, accept = RES_ALL, i;
 		if (items > 4) {
-			warn("extra items");
-			//opt = newHV();
-			int i;
-			for (i = 3; i < items-1; i+= 2) {
-				// accept => AV(type[])
-				//if (strcmp(SvPV_nolen(ST(i))))
-				warn("%s = %s", SvPV_nolen(ST(i)), SvPV_nolen(ST(i+1)));
+			int i,j;
+			for (i = 3; i < items-1; i = i + 2) {
+				//warn("%d: option %s = %s", i, SvPV_nolen(ST(i)), SvPV_nolen(ST(i+1)));
+				
+				if (strcmp(SvPV_nolen(ST(i)), "accept" ) == 0) {
+					accept = 0;
+					SV **key;
+					AV *acc = (AV *)SvRV(ST(i+1));
+					for (j = 0; j <= av_len(acc); j++) {
+						if ((key = av_fetch(acc,j,0)) && *key && SvOK(*key)) {
+							t = SvPV( *key,l );
+							map_type(accept,t,l);
+						}
+						else {
+							croak("Bad value in accept: %s",key ? SvPV_nolen(*key) : "undef");
+						}
+					}
+					if (accept == 0)
+						croak("Not accepting any kind of record");
+				}
+				else
+				if (strcmp(SvPV_nolen(ST(i)), "search" ) == 0) {
+					warn("search not implemented yet");
+				}
+				else {
+					croak("Unknown option %s = %s", SvPV_nolen(ST(i)), SvPV_nolen(ST(i+1)));
+				}
 			}
 		}
-		int flags = 0;
-		if (l == 1 ) {
-			if (*t == '*') {
-				flags |= RES_ALL;
-			}
-			else
-			if (strncasecmp( t,"a",1 )) {
-				flags |= RES_A;
-			}
-			else {
-				croak("Bad type: %s",t);
-			}
-		}
-		else
-		if (l == 2) {
-			if (strncasecmp( t,"ns",2 )) {
-				flags |= RES_NS;
-			}
-			else
-			if (strncasecmp( t,"mx",2 )) {
-				flags |= RES_MX;
-			}
-			else {
-				croak("Bad type: %s",t);
-			}
-		}
-		else
-		if (l == 3) {
-			if (strncasecmp( t,"soa",3 ) == 0) {
-				flags |= RES_SOA;
-			}
-			else
-			if (strncasecmp( t,"txt",3 ) == 0) {
-				flags |= RES_TXT;
-			}
-			else
-			if (strncasecmp( t,"ptr",3 ) == 0) {
-				flags |= RES_PTR;
-			}
-			else
-			if (strncasecmp( t,"srv",3 ) == 0) {
-				flags |= RES_SRV;
-			}
-			else {
-				croak("Bad type: %s",t);
-			}
-		}
-		else
-		if (l == 4 && strncasecmp( t,"aaaa",4 ) == 0) {
-			flags |= RES_AAAA;
-		}
-		else
-		if (l == 5 && strncasecmp( t,"naptr",5 ) == 0) {
-			flags |= RES_NAPTR;
-		}
-		else {
-			croak("Bad type: %s",t);
-		}
+		t = SvPV( type,l );
+		map_type(flags,t,l);
+		flags &= accept;
 		
 		SV *rr = newSV(sizeof(ev_ares_any));
 		SvUPGRADE(rr,SVt_PV);
@@ -538,9 +589,17 @@ void resolve(SV *cls, SV *host, SV * type, ...)
 			any->cv++;
 			ev_ares_txt(EV_DEFAULT,&resolver,SvPV_nolen(host),rr,callback_any_txt);
 		}
+		if (flags & RES_SRV) {
+			any->cv++;
+			ev_ares_srv(EV_DEFAULT,&resolver,SvPV_nolen(host),rr,callback_any_srv);
+		}
 		if (flags & RES_TXT) {
 			any->cv++;
 			ev_ares_ptr(EV_DEFAULT,&resolver,SvPV_nolen(host),rr,callback_any_ptr);
+		}
+		if (flags & RES_NAPTR) {
+			any->cv++;
+			ev_ares_naptr(EV_DEFAULT,&resolver,SvPV_nolen(host),rr,callback_any_naptr);
 		}
 
 void a(char *host, SV *cb)
